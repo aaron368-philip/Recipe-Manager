@@ -1,0 +1,1692 @@
+RECIPE MANAGAER
+
+app.py 
+import sqlite3
+from flask import Flask, render_template, request, redirect, url_for, jsonify, abort
+import openai
+from functools import wraps
+import re
+import os
+
+app = Flask(__name__)
+DB_NAME = "recipes.db"
+GROQ_API_KEY = "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"  # Load from environment variable
+
+
+# Database connection helper
+def get_db_connection():
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+# Initialize database
+def init_db():
+    with get_db_connection() as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS recipes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            ingredients TEXT NOT NULL,
+            instructions TEXT NOT NULL,
+            image_url TEXT,
+            time_hours INTEGER DEFAULT 0,
+            time_minutes INTEGER DEFAULT 0,
+            difficulty INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        conn.commit()
+
+
+# Decorator for database operations
+def with_db_connection(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        with get_db_connection() as conn:
+            kwargs['conn'] = conn
+            return func(*args, **kwargs)
+
+    return wrapper
+
+
+# Input sanitization
+def sanitize_input(text):
+    if not text:
+        return text
+    return re.sub(r'<[^>]*>', '', text).strip()
+
+
+@app.route("/")
+def home():
+    return render_template("index.html")
+
+
+@app.route("/category/<category>")
+@with_db_connection
+def list_recipes(category, conn):
+    recipes = conn.execute(
+        "SELECT id, name, image_url, time_hours, time_minutes, difficulty FROM recipes WHERE category = ? ORDER BY name",
+        (category,)
+    ).fetchall()
+    return render_template("recipes.html", recipes=recipes, category=category)
+
+
+@app.route("/view/<int:recipe_id>")
+@with_db_connection
+def view_recipe(recipe_id, conn):
+    recipe = conn.execute(
+        "SELECT * FROM recipes WHERE id = ?",
+        (recipe_id,)
+    ).fetchone()
+    if not recipe:
+        abort(404)
+    return render_template("view_recipe.html", recipe=dict(recipe))
+
+
+@app.route("/add/<category>", methods=["GET", "POST"])
+@with_db_connection
+def add_recipe(category, conn):
+    if request.method == "POST":
+        try:
+            recipe_data = {
+                'name': sanitize_input(request.form["name"]),
+                'category': category,
+                'ingredients': sanitize_input(request.form["ingredients"]),
+                'instructions': sanitize_input(request.form["instructions"]),
+                'image_url': sanitize_input(request.form["image_url"]),
+                'time_hours': int(request.form.get("time_hours", 0)),
+                'time_minutes': int(request.form.get("time_minutes", 0)),
+                'difficulty': min(max(int(request.form.get("difficulty", 1)), 1), 5)
+            }
+            conn.execute(
+                """INSERT INTO recipes 
+                (name, category, ingredients, instructions, image_url, time_hours, time_minutes, difficulty)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                tuple(recipe_data.values())
+            )
+            conn.commit()
+            return redirect(url_for("list_recipes", category=category))
+        except (ValueError, KeyError) as e:
+            return render_template("add_recipe.html",
+                                   category=category,
+                                   error="Invalid input. Please check your values.")
+    return render_template("add_recipe.html", category=category)
+
+
+@app.route("/edit/<int:recipe_id>", methods=["GET", "POST"])
+@with_db_connection
+def edit_recipe(recipe_id, conn):
+    if request.method == "POST":
+        try:
+            recipe_data = {
+                'name': sanitize_input(request.form["name"]),
+                'ingredients': sanitize_input(request.form["ingredients"]),
+                'instructions': sanitize_input(request.form["instructions"]),
+                'image_url': sanitize_input(request.form["image_url"]),
+                'time_hours': int(request.form.get("time_hours", 0)),
+                'time_minutes': int(request.form.get("time_minutes", 0)),
+                'difficulty': min(max(int(request.form.get("difficulty", 1)), 1), 5),
+                'recipe_id': recipe_id
+            }
+            conn.execute(
+                """UPDATE recipes SET 
+                name=?, ingredients=?, instructions=?, image_url=?,
+                time_hours=?, time_minutes=?, difficulty=?
+                WHERE id=?""",
+                tuple(recipe_data.values())
+            )
+            conn.commit()
+            return redirect(url_for("view_recipe", recipe_id=recipe_id))
+        except (ValueError, KeyError) as e:
+            recipe = conn.execute(
+                "SELECT * FROM recipes WHERE id = ?",
+                (recipe_id,)
+            ).fetchone()
+            return render_template("edit_recipe.html",
+                                   recipe=dict(recipe),
+                                   error="Invalid input. Please check your values.")
+
+    recipe = conn.execute(
+        "SELECT * FROM recipes WHERE id = ?",
+        (recipe_id,)
+    ).fetchone()
+    if not recipe:
+        abort(404)
+    return render_template("edit_recipe.html", recipe=dict(recipe))
+
+
+@app.route("/delete/<int:recipe_id>")
+@with_db_connection
+def delete_recipe(recipe_id, conn):
+    category = conn.execute(
+        "SELECT category FROM recipes WHERE id = ?",
+        (recipe_id,)
+    ).fetchone()
+    if category:
+        conn.execute("DELETE FROM recipes WHERE id = ?", (recipe_id,))
+        conn.commit()
+        return redirect(url_for("list_recipes", category=category[0]))
+    return redirect(url_for("home"))
+
+
+@app.route("/search")
+@with_db_connection
+def search(conn):
+    query = sanitize_input(request.args.get("q", ""))
+    if not query:
+        return redirect(url_for("home"))
+    recipes = conn.execute(
+        "SELECT id, name, image_url, time_hours, time_minutes, difficulty FROM recipes WHERE name LIKE ?",
+        ('%' + query + '%',)
+    ).fetchall()
+    return render_template("recipes.html",
+                           recipes=recipes,
+                           category=f"Search Results for '{query}'")
+
+
+def find_recipe_link(user_message):
+    with get_db_connection() as conn:
+        recipes = conn.execute("SELECT id, name FROM recipes").fetchall()
+    user_message_lower = user_message.lower()
+    for recipe in recipes:
+        if recipe['name'].lower() in user_message_lower:
+            return url_for("view_recipe", recipe_id=recipe['id'], _external=True)
+    return None
+
+
+@app.route("/clear_chat", methods=["POST"])
+def clear_chat():
+    # You could add server-side clearing logic here if needed
+    return jsonify({"status": "success"})
+
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    try:
+        data = request.get_json()
+        messages = data.get("messages", [])
+        user_message = messages[-1]["content"].lower() if messages else ""
+        current_state = data.get("state", {})
+
+        # Check if this is a repeated greeting
+        is_repeated_greeting = (
+                len(messages) > 1 and
+                any(msg["content"] == "Hello! I'm Gorden. How can I help with recipes today?"
+                    for msg in messages)
+        )
+
+        # Handle recipe addition flow
+        if current_state.get("expecting_image_url"):
+            # Process the image URL and generate full recipe
+            image_url = user_message.strip()
+            recipe_request = current_state.get("recipe_request", "")
+
+            # Generate complete recipe using AI
+            client = openai.OpenAI(
+                api_key=GROQ_API_KEY,
+                base_url="https://api.groq.com/openai/v1"
+            )
+
+            response = client.chat.completions.create(
+                model="llama3-8b-8192",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """Generate complete recipe details in JSON format with these exact fields:
+                        {
+                            "name": "Recipe Name",
+                            "category": "Main Course/Soup/Dessert etc.",
+                            "ingredients": ["1 cup flour", "2 tbsp sugar"],
+                            "instructions": ["Preheat oven to 350F", "Mix dry ingredients"],
+                            "time_hours": 1,
+                            "time_minutes": 30,
+                            "difficulty": 3,
+                            "servings": 4
+                        }
+                        Include exact measurements and clear steps."""
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Create complete recipe for: {recipe_request}"
+                    }
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.7
+            )
+
+            try:
+                recipe_data = json.loads(response.choices[0].message.content)
+
+                # Add to database
+                with get_db_connection() as conn:
+                    conn.execute("""
+                        INSERT INTO recipes (name, category, ingredients, instructions, 
+                                          time_hours, time_minutes, difficulty, servings, image_url)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                                 (
+                                     recipe_data["name"],
+                                     recipe_data.get("category", "General"),
+                                     "\n".join(recipe_data["ingredients"]),
+                                     "\n".join(recipe_data["instructions"]),
+                                     recipe_data.get("time_hours", 0),
+                                     recipe_data.get("time_minutes", 30),
+                                     recipe_data.get("difficulty", 3),
+                                     recipe_data.get("servings", 4),
+                                     image_url
+                                 ))
+                    conn.commit()
+
+                # Format success response
+                prep_time = ""
+                if recipe_data.get("time_hours", 0) > 0:
+                    prep_time += f"{recipe_data['time_hours']} hour"
+                    if recipe_data["time_hours"] > 1:
+                        prep_time += "s"
+                if recipe_data.get("time_minutes", 0) > 0:
+                    if prep_time:
+                        prep_time += " "
+                    prep_time += f"{recipe_data['time_minutes']} minute"
+                    if recipe_data["time_minutes"] > 1:
+                        prep_time += "s"
+
+                formatted_reply = (
+                        f"✅ Successfully added {recipe_data['name']} to your recipes!\n\n"
+                        f"**Category:** {recipe_data.get('category', 'General')}\n"
+                        f"**Servings:** {recipe_data.get('servings', 4)}\n"
+                        f"**Prep Time:** {prep_time if prep_time else 'Not specified'}\n"
+                        f"**Difficulty:** {recipe_data.get('difficulty', 3)}/5\n\n"
+                        f"**Ingredients:**\n" + "\n".join(f"- {i}" for i in recipe_data["ingredients"]) + "\n\n"
+                                                                                                          f"**Instructions:**\n" + "\n".join(
+                    f"{i + 1}. {step}" for i, step in enumerate(recipe_data["instructions"])))
+
+                return jsonify({
+                    "reply": formatted_reply,
+                    "redirect_url": None,
+                    "state": {}  # Clear the state
+                })
+
+            except Exception as e:
+                app.logger.error(f"Recipe add error: {str(e)}")
+                return jsonify({
+                    "reply": "Sorry, I had trouble saving that recipe. Please try again later.",
+                    "redirect_url": None,
+                    "state": {}
+                })
+
+        # Check for add recipe request
+        add_phrases = ["add recipe", "new recipe", "create recipe", "save recipe"]
+        if any(phrase in user_message for phrase in add_phrases):
+            return jsonify({
+                "reply": "I'll create that recipe for you! Please provide an image URL for the dish:",
+                "redirect_url": None,
+                "state": {
+                    "expecting_image_url": True,
+                    "recipe_request": user_message
+                }
+            })
+
+        # Check for specific recipe requests first
+        if "how to cook dal" in user_message or "dal recipe" in user_message:
+            dal_recipe = """
+**Simple Dal (Lentil Soup) Recipe**
+
+**Servings:** 4-6
+
+**Ingredients:**
+- 1 cup split red lentils (masoor dal)
+- 4 cups water
+- 1 tbsp vegetable oil
+- 1 small onion, chopped
+- 2 garlic cloves, minced
+- 1 inch ginger, grated
+- 1 tsp cumin
+- 1 tsp coriander
+- Salt to taste
+- (Optional) 1-2 dried red chilies
+
+**Instructions:**
+
+1. **Prepare Lentils:**
+   - Rinse lentils until water runs clear
+   - Drain and set aside
+
+2. **Cook Lentils:**
+   - Combine lentils and water in pot
+   - Bring to boil, then simmer 20-25 mins
+   - Skim off any foam
+
+3. **Make Tempering:**
+   - Heat oil in pan
+   - Add cumin, let sizzle (10 sec)
+   - Add onion, sauté until golden
+   - Add garlic, ginger, spices (1 min)
+
+4. **Combine:**
+   - Mix tempering into cooked lentils
+   - Simmer 5 more minutes
+   - Adjust salt
+
+**Tips:** 
+- Blend half for creamier texture
+- Add tomatoes for tanginess
+- Spinach adds nutrition"""
+
+            return jsonify({
+                "reply": dal_recipe,
+                "redirect_url": None
+            })
+
+        # Check for general recipe triggers
+        trigger_phrases = ["how to make", "recipe for", "make", "prepare", "cook"]
+        if any(phrase in user_message for phrase in trigger_phrases):
+            link = find_recipe_link(user_message)
+            if link:
+                return jsonify({
+                    "reply": "I found a recipe for you!",
+                    "redirect_url": link
+                })
+
+        # Simple greetings response
+        greetings = ["hi", "hello", "hey", "hallo"]
+        if any(greeting in user_message for greeting in greetings) and not is_repeated_greeting:
+            return jsonify({
+                "reply": "Hello! I'm Gorden. Ask me about recipes or cooking tips!",
+                "redirect_url": None
+            })
+
+        # Get context from database
+        with get_db_connection() as conn:
+            recipes = conn.execute("""
+                SELECT name, ingredients, instructions 
+                FROM recipes 
+                ORDER BY RANDOM() LIMIT 3
+            """).fetchall()
+
+        recipe_context = "\n".join(
+            f"Recipe: {r['name']}\nKey Ingredients: {r['ingredients'][:50]}...\n"
+            for r in recipes
+        )
+
+        # AI response for other queries
+        client = openai.OpenAI(
+            api_key=GROQ_API_KEY,
+            base_url="https://api.groq.com/openai/v1"
+        )
+
+        response = client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"""You are Gorden, a professional cooking assistant. Follow these rules:
+                    - Use clear headings like **Ingredients**, **Instructions**
+                    - List ingredients with bullet points
+                    - Provide step-by-step instructions
+                    - Include measurements and cooking times
+                    - Be friendly and helpful
+
+                    Available recipes:\n{recipe_context}"""
+                },
+                *messages[-3:]
+            ],
+            temperature=0.7,
+            max_tokens=300
+        )
+
+        return jsonify({
+            "reply": response.choices[0].message.content,
+            "redirect_url": None
+        })
+
+    except Exception as e:
+        app.logger.error(f"Chat error: {str(e)}")
+        return jsonify({
+            "reply": "Sorry, I'm having trouble in the kitchen right now. Could you try asking differently?",
+            "redirect_url": None
+        })
+
+if __name__ == "__main__":
+    init_db()
+    app.run(debug=True, host='0.0.0.0', port=5000)
+
+
+HTML CODES
+index.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Recipe Manager</title>
+    <style>
+        :root {
+            --primary-color: #4CAF50;
+            --secondary-color: #FF9800;
+            --dark-color: #333;
+            --light-color: #f8f8f8;
+            --shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: var(--light-color);
+            color: var(--dark-color);
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            background-color: var(--primary-color);
+            color: white;
+            padding: 20px 0;
+            text-align: center;
+            margin-bottom: 30px;
+            box-shadow: var(--shadow);
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 2.5rem;
+        }
+
+        .search-box {
+            text-align: center;
+            margin: 30px 0;
+        }
+
+        .search-box input {
+            padding: 12px 20px;
+            width: 60%;
+            max-width: 500px;
+            border: 2px solid #ddd;
+            border-radius: 30px;
+            font-size: 1rem;
+            outline: none;
+            transition: border 0.3s;
+        }
+
+        .search-box input:focus {
+            border-color: var(--primary-color);
+        }
+
+        .search-box button {
+            padding: 12px 25px;
+            background-color: var(--secondary-color);
+            color: white;
+            border: none;
+            border-radius: 30px;
+            cursor: pointer;
+            font-size: 1rem;
+            margin-left: 10px;
+            transition: background 0.3s;
+        }
+
+        .search-box button:hover {
+            background-color: #e68a00;
+        }
+
+        .category-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 20px;
+            padding: 20px 0;
+        }
+
+        .category-card {
+            background: white;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: var(--shadow);
+            transition: transform 0.3s, box-shadow 0.3s;
+            text-align: center;
+            text-decoration: none;
+            color: var(--dark-color);
+        }
+
+        .category-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        }
+
+        .category-card img {
+            width: 100%;
+            height: 150px;
+            object-fit: cover;
+        }
+
+        .category-card h3 {
+            margin: 15px 0;
+            padding: 0 15px;
+        }
+
+        /* Chatbot Styles */
+        #chat-container {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            width: 350px;
+            max-width: 90%;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 5px 25px rgba(0,0,0,0.2);
+            overflow: hidden;
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            max-height: 80vh;
+            transition: all 0.3s;
+        }
+
+        #chat-container.minimized {
+            height: 50px;
+            overflow: hidden;
+        }
+
+        #chat-header {
+            background: var(--primary-color);
+            color: white;
+            padding: 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            cursor: pointer;
+        }
+
+        #chat-header h3 {
+            margin: 0;
+            font-size: 1.2rem;
+        }
+
+        #chat-controls button {
+            background: none;
+            border: none;
+            color: white;
+            font-size: 1.2rem;
+            cursor: pointer;
+            margin-left: 10px;
+            transition: transform 0.2s;
+        }
+
+        #chat-controls button:hover {
+            transform: scale(1.1);
+        }
+
+        #clear-chat {
+            font-size: 1.1rem;
+        }
+
+        #chat-box {
+            flex: 1;
+            overflow-y: auto;
+            padding: 15px;
+            background: #f9f9f9;
+        }
+
+        .message {
+            margin-bottom: 15px;
+            max-width: 80%;
+            padding: 10px 15px;
+            border-radius: 18px;
+            line-height: 1.4;
+            position: relative;
+            animation: fadeIn 0.3s ease-out;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .user-message {
+            background: var(--primary-color);
+            color: white;
+            margin-left: auto;
+            border-bottom-right-radius: 5px;
+        }
+
+        .bot-message {
+            background: white;
+            color: var(--dark-color);
+            border: 1px solid #eee;
+            margin-right: auto;
+            border-bottom-left-radius: 5px;
+        }
+
+        .typing-indicator {
+            display: flex;
+            padding: 10px 15px;
+            background: white;
+            border-radius: 18px;
+            margin-bottom: 15px;
+            width: fit-content;
+            border: 1px solid #eee;
+        }
+
+        .typing-dot {
+            width: 8px;
+            height: 8px;
+            background: #ccc;
+            border-radius: 50%;
+            margin: 0 2px;
+            animation: typingAnimation 1.4s infinite ease-in-out;
+        }
+
+        .typing-dot:nth-child(1) { animation-delay: 0s; }
+        .typing-dot:nth-child(2) { animation-delay: 0.2s; }
+        .typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+        @keyframes typingAnimation {
+            0%, 60%, 100% { transform: translateY(0); }
+            30% { transform: translateY(-5px); }
+        }
+
+        #chat-input-container {
+            display: flex;
+            border-top: 1px solid #eee;
+            background: white;
+        }
+
+        #chat-input {
+            flex: 1;
+            border: none;
+            padding: 15px;
+            outline: none;
+            font-size: 1rem;
+        }
+
+        #chat-send {
+            background: var(--primary-color);
+            color: white;
+            border: none;
+            padding: 0 20px;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+
+        #chat-send:hover {
+            background: #3d8b40;
+        }
+
+        /* Responsive Design */
+        @media (max-width: 768px) {
+            .category-grid {
+                grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            }
+
+            #chat-container {
+                width: 90%;
+                right: 5%;
+                bottom: 10px;
+            }
+
+            .search-box input {
+                width: 70%;
+            }
+        }
+
+        @media (max-width: 480px) {
+            h1 {
+                font-size: 2rem;
+            }
+
+            .search-box input {
+                width: 100%;
+                margin-bottom: 10px;
+            }
+
+            .search-box button {
+                width: 100%;
+                margin-left: 0;
+            }
+
+            .category-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>Recipe Manager</h1>
+            <p>Your personal cooking assistant</p>
+        </div>
+    </header>
+
+    <main class="container">
+        <div class="search-box">
+            <form action="/search" method="GET">
+                <input type="text" name="q" placeholder="Search for recipes..." required>
+                <button type="submit">Search</button>
+            </form>
+        </div>
+
+        <h2 style="text-align: center; margin-bottom: 20px;">Recipe Categories</h2>
+
+        <div class="category-grid">
+            <a href="/category/Breakfast" class="category-card">
+                <h3>Breakfast</h3>
+            </a>
+
+            <a href="/category/Lunch" class="category-card">
+                <h3>Lunch & Dinner</h3>
+            </a>
+
+            <a href="/category/Desserts" class="category-card">
+                <h3>Desserts</h3>
+            </a>
+
+            <a href="/category/Salads" class="category-card">
+                <h3>Salads</h3>
+            </a>
+
+            <a href="/category/Soups" class="category-card">
+                <h3>Soups</h3>
+            </a>
+
+            <a href="/category/Snacks" class="category-card">
+                <h3>Snacks</h3>
+            </a>
+        </div>
+    </main>
+
+    <!-- Chatbot UI -->
+    <div id="chat-container">
+        <div id="chat-header">
+            <h3>🍳 Chef Assistant</h3>
+            <div id="chat-controls">
+                <button id="clear-chat" title="Clear conversation">🗑️</button>
+                <button id="minimize-chat">−</button>
+                <button id="close-chat">×</button>
+            </div>
+        </div>
+
+        <div id="chat-box"></div>
+
+        <div id="chat-input-container">
+            <input type="text" id="chat-input" placeholder="Ask about recipes..." autocomplete="off">
+            <button id="chat-send">Send</button>
+        </div>
+    </div>
+
+    <script>
+        // Chatbot functionality
+        const chatContainer = document.getElementById('chat-container');
+        const chatBox = document.getElementById('chat-box');
+        const chatInput = document.getElementById('chat-input');
+        const chatSend = document.getElementById('chat-send');
+        const minimizeBtn = document.getElementById('minimize-chat');
+        const closeBtn = document.getElementById('close-chat');
+        const chatHeader = document.getElementById('chat-header');
+
+        // Load chat history from localStorage
+        let messageHistory = JSON.parse(localStorage.getItem('chatHistory')) || [];
+
+        // Initialize chat
+        function initChat() {
+            renderMessages();
+
+            // If first time, show welcome message
+            if (messageHistory.length === 0) {
+                addMessage('assistant', "Hi there! I'm Gorden. Ask me about recipes, cooking tips, or meal ideas!");
+            }
+        }
+
+        // Add message to chat
+        function addMessage(role, content) {
+            const message = { role, content };
+            messageHistory.push(message);
+            localStorage.setItem('chatHistory', JSON.stringify(messageHistory));
+            renderMessages();
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+
+        // Show typing indicator
+        function showTyping() {
+            const typingElement = document.createElement('div');
+            typingElement.className = 'typing-indicator';
+            typingElement.id = 'typing-indicator';
+            typingElement.innerHTML = `
+                <div class="typing-dot"></div>
+                <div class="typing-dot"></div>
+                <div class="typing-dot"></div>
+            `;
+            chatBox.appendChild(typingElement);
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+
+        // Hide typing indicator
+        function hideTyping() {
+            const typingElement = document.getElementById('typing-indicator');
+            if (typingElement) {
+                typingElement.remove();
+            }
+        }
+
+        function clearChat() {
+            if (confirm("Are you sure you want to clear the conversation?")) {
+                messageHistory = [];
+                localStorage.removeItem('chatHistory');
+                renderMessages();
+
+                // Optional: Keep the welcome message
+                addMessage('assistant', "Hi there! I'm Gorden. Ask me about recipes!");
+            }
+        }
+
+        // Render all messages
+        function renderMessages() {
+            chatBox.innerHTML = '';
+            messageHistory.forEach(msg => {
+                const messageElement = document.createElement('div');
+                messageElement.className = `message ${msg.role}-message`;
+                messageElement.textContent = msg.content;
+                chatBox.appendChild(messageElement);
+            });
+        }
+
+        // Send message to server
+        async function sendMessage() {
+            const message = chatInput.value.trim();
+            if (!message) return;
+
+            // Add user message
+            addMessage('user', message);
+            chatInput.value = '';
+
+            showTyping();
+
+            try {
+                const response = await fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        messages: [{ role: 'user', content: message }]
+                    })
+                });
+
+                if (!response.ok) throw new Error('Network response was not ok');
+
+                const data = await response.json();
+                hideTyping();
+
+                if (data.reply) {
+                    addMessage('assistant', data.reply);
+                }
+
+                if (data.redirect_url) {
+                    window.open(data.redirect_url, '_blank');
+                }
+            } catch (error) {
+                hideTyping();
+                addMessage('assistant', "Sorry, I'm having trouble connecting. Please try again later.");
+                console.error('Chat error:', error);
+            }
+        }
+
+        // Event listeners
+        chatInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendMessage();
+        });
+
+        chatSend.addEventListener('click', sendMessage);
+
+        minimizeBtn.addEventListener('click', () => {
+            chatContainer.classList.toggle('minimized');
+            minimizeBtn.textContent = chatContainer.classList.contains('minimized') ? '+' : '−';
+        });
+
+        closeBtn.addEventListener('click', () => {
+            chatContainer.style.display = 'none';
+        });
+
+        // Initialize chat when page loads
+        initChat();
+
+        // Make chat draggable
+        let isDragging = false;
+        let offsetX, offsetY;
+
+        chatHeader.addEventListener('mousedown', (e) => {
+            if (e.target === minimizeBtn || e.target === closeBtn) return;
+
+            isDragging = true;
+            offsetX = e.clientX - chatContainer.getBoundingClientRect().left;
+            offsetY = e.clientY - chatContainer.getBoundingClientRect().top;
+            chatContainer.style.cursor = 'grabbing';
+        });
+
+        document.addEventListener('mouseup', () => {
+            isDragging = false;
+            chatContainer.style.cursor = 'default';
+        });
+
+        document.getElementById('clear-chat').addEventListener('click', clearChat);
+
+
+        document.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+
+            let newLeft = e.clientX - offsetX;
+            let newTop = e.clientY - offsetY;
+
+            // Boundary checking
+            newLeft = Math.max(0, Math.min(newLeft, window.innerWidth - chatContainer.offsetWidth));
+            newTop = Math.max(0, Math.min(newTop, window.innerHeight - chatContainer.offsetHeight));
+
+            chatContainer.style.left = `${newLeft}px`;
+            chatContainer.style.top = `${newTop}px`;
+        });
+    </script>
+</body>
+</html>
+
+edit_recipe.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Edit Recipe</title>
+    <style>
+        :root {
+            --primary-color: #4CAF50;
+            --secondary-color: #FF9800;
+            --dark-color: #333;
+            --light-color: #f8f8f8;
+            --shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: var(--light-color);
+            color: var(--dark-color);
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            background-color: var(--primary-color);
+            color: white;
+            padding: 20px 0;
+            text-align: center;
+            margin-bottom: 30px;
+            box-shadow: var(--shadow);
+        }
+
+        h2 {
+            text-align: center;
+            color: var(--dark-color);
+            margin-bottom: 30px;
+        }
+
+        form {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: var(--shadow);
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: var(--dark-color);
+        }
+
+        input[type="text"],
+        input[type="url"],
+        input[type="number"],
+        textarea {
+            width: 100%;
+            padding: 12px;
+            margin-bottom: 20px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 1rem;
+            transition: border 0.3s;
+        }
+
+        input[type="text"]:focus,
+        input[type="url"]:focus,
+        input[type="number"]:focus,
+        textarea:focus {
+            border-color: var(--primary-color);
+            outline: none;
+        }
+
+        .time-inputs {
+            display: flex;
+            gap: 15px;
+        }
+
+        .time-inputs input {
+            flex: 1;
+        }
+
+        button {
+            background-color: var(--secondary-color);
+            color: white;
+            border: none;
+            padding: 12px 20px;
+            font-size: 1rem;
+            border-radius: 5px;
+            cursor: pointer;
+            width: 100%;
+            transition: background-color 0.3s;
+        }
+
+        button:hover {
+            background-color: #e68a00;
+        }
+
+        @media (max-width: 600px) {
+            .container {
+                padding: 15px;
+            }
+
+            form {
+                padding: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>Edit Recipe</h1>
+        </div>
+    </header>
+
+    <div class="container">
+        <h2>Edit Recipe - {{ recipe['name'] }}</h2>
+        <form action="/edit/{{ recipe['id'] }}" method="POST">
+            <label>Recipe Name:</label>
+            <input type="text" name="name" value="{{ recipe['name'] }}" required>
+
+            <label>Image URL:</label>
+            <input type="url" name="image_url" value="{{ recipe['image_url'] }}">
+
+            <label>Ingredients:</label>
+            <textarea name="ingredients" rows="4" required>{{ recipe['ingredients'] }}</textarea>
+
+            <label>Instructions:</label>
+            <textarea name="instructions" rows="5" required>{{ recipe['instructions'] }}</textarea>
+
+            <label>Preparation Time:</label>
+            <div class="time-inputs">
+                <input type="number" name="time_hours" value="{{ recipe['time_hours'] }}" placeholder="Hours" min="0">
+                <input type="number" name="time_minutes" value="{{ recipe['time_minutes'] }}" placeholder="Minutes" min="0" max="59">
+            </div>
+
+            <label>Difficulty (1-5):</label>
+            <input type="number" name="difficulty" min="1" max="5" value="{{ recipe['difficulty'] }}" required>
+
+            <button type="submit">Save Changes</button>
+        </form>
+    </div>
+</body>
+</html>
+
+add_recipe.html
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Add Recipe</title>
+    <style>
+        :root {
+            --primary-color: #4CAF50;
+            --secondary-color: #FF9800;
+            --dark-color: #333;
+            --light-color: #f8f8f8;
+            --shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: var(--light-color);
+            color: var(--dark-color);
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            background-color: var(--primary-color);
+            color: white;
+            padding: 20px 0;
+            text-align: center;
+            margin-bottom: 30px;
+            box-shadow: var(--shadow);
+        }
+
+        h2 {
+            text-align: center;
+            color: var(--dark-color);
+            margin-bottom: 30px;
+        }
+
+        form {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: var(--shadow);
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: var(--dark-color);
+        }
+
+        input[type="text"],
+        input[type="url"],
+        input[type="number"],
+        textarea {
+            width: 100%;
+            padding: 12px;
+            margin-bottom: 20px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 1rem;
+            transition: border 0.3s;
+        }
+
+        input[type="text"]:focus,
+        input[type="url"]:focus,
+        input[type="number"]:focus,
+        textarea:focus {
+            border-color: var(--primary-color);
+            outline: none;
+        }
+
+        .time-inputs {
+            display: flex;
+            gap: 15px;
+        }
+
+        .time-inputs input {
+            flex: 1;
+        }
+
+        button {
+            background-color: var(--primary-color);
+            color: white;
+            border: none;
+            padding: 12px 20px;
+            font-size: 1rem;
+            border-radius: 5px;
+            cursor: pointer;
+            width: 100%;
+            transition: background-color 0.3s;
+        }
+
+        button:hover {
+            background-color: #3d8b40;
+        }
+
+        @media (max-width: 600px) {
+            .container {
+                padding: 15px;
+            }
+
+            form {
+                padding: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>Add New Recipe</h1>
+        </div>
+    </header>
+
+    <div class="container">
+        <h2>Add New Recipe - {{ category }}</h2>
+        <form action="/add/{{ category }}" method="POST">
+            <label>Recipe Name:</label>
+            <input type="text" name="name" required>
+
+            <label>Image URL:</label>
+            <input type="url" name="image_url">
+
+            <label>Ingredients:</label>
+            <textarea name="ingredients" rows="4" required placeholder="Enter each ingredient on a new line"></textarea>
+
+            <label>Instructions:</label>
+            <textarea name="instructions" rows="5" required placeholder="Enter each step on a new line"></textarea>
+
+            <label>Preparation Time:</label>
+            <div class="time-inputs">
+                <input type="number" name="time_hours" placeholder="Hours" min="0">
+                <input type="number" name="time_minutes" placeholder="Minutes" min="0" max="59">
+            </div>
+
+            <label>Difficulty (1-5):</label>
+            <input type="number" name="difficulty" min="1" max="5" required>
+
+            <button type="submit">Add Recipe</button>
+        </form>
+    </div>
+</body>
+</html>
+
+recipes.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>{{ category }} Recipes</title>
+    <style>
+        :root {
+            --primary-color: #4CAF50;
+            --secondary-color: #FF9800;
+            --dark-color: #333;
+            --light-color: #f8f8f8;
+            --shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: var(--light-color);
+            color: var(--dark-color);
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            background-color: var(--primary-color);
+            color: white;
+            padding: 20px 0;
+            text-align: center;
+            margin-bottom: 30px;
+            box-shadow: var(--shadow);
+        }
+
+        h2 {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .back-link {
+            display: inline-block;
+            margin-bottom: 20px;
+            color: var(--primary-color);
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .add-btn {
+            display: block;
+            background-color: var(--primary-color);
+            color: white;
+            text-align: center;
+            padding: 12px;
+            border-radius: 5px;
+            text-decoration: none;
+            margin: 0 auto 30px;
+            max-width: 200px;
+            transition: background-color 0.3s;
+        }
+
+        .add-btn:hover {
+            background-color: #3d8b40;
+        }
+
+        .recipe-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 25px;
+        }
+
+        .recipe-card {
+            background: white;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: var(--shadow);
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+
+        .recipe-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        }
+
+        .recipe-card img {
+            width: 100%;
+            height: 180px;
+            object-fit: cover;
+        }
+
+        .recipe-content {
+            padding: 20px;
+        }
+
+        .recipe-content h3 {
+            margin: 0 0 10px;
+            font-size: 1.2rem;
+        }
+
+        .recipe-meta {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 15px;
+            font-size: 0.9rem;
+        }
+
+        .difficulty {
+            color: #ff6b6b;
+        }
+
+        .actions {
+            display: flex;
+            justify-content: space-between;
+            border-top: 1px solid #eee;
+            padding-top: 15px;
+        }
+
+        .actions a {
+            color: var(--primary-color);
+            text-decoration: none;
+            font-weight: 600;
+            transition: color 0.3s;
+        }
+
+        .actions a:hover {
+            color: #3d8b40;
+        }
+
+        .actions a.delete {
+            color: #ff6b6b;
+        }
+
+        @media (max-width: 768px) {
+            .recipe-grid {
+                grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+            }
+        }
+
+        @media (max-width: 480px) {
+            .recipe-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>{{ category }} Recipes</h1>
+        </div>
+    </header>
+
+    <div class="container">
+        <a href="/" class="back-link">← Back to Home</a>
+        <a href="/add/{{ category }}" class="add-btn">+ Add New Recipe</a>
+
+        <div class="recipe-grid">
+            {% for recipe in recipes %}
+            <div class="recipe-card">
+                <img src="{{ recipe['image_url'] }}" alt="{{ recipe['name'] }}">
+                <div class="recipe-content">
+                    <h3>{{ recipe['name'] }}</h3>
+                    <div class="recipe-meta">
+                        <span class="difficulty">Difficulty: {{ '★' * recipe['difficulty'] }}{{ '☆' * (5 - recipe['difficulty']) }}</span>
+                        <span>Time: {{ recipe['time_hours'] }}h {{ recipe['time_minutes'] }}m</span>
+                    </div>
+                    <div class="actions">
+                        <a href="/view/{{ recipe['id'] }}">View</a>
+                        <a href="/edit/{{ recipe['id'] }}">Edit</a>
+                        <a href="/delete/{{ recipe['id'] }}" class="delete" onclick="return confirm('Delete this recipe?');">Delete</a>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</body>
+</html>
+
+view_recipe.html
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>{{ recipe['name'] }}</title>
+    <style>
+        :root {
+            --primary-color: #4CAF50;
+            --secondary-color: #FF9800;
+            --dark-color: #333;
+            --light-color: #f8f8f8;
+            --shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: var(--light-color);
+            color: var(--dark-color);
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            background-color: var(--primary-color);
+            color: white;
+            padding: 20px 0;
+            text-align: center;
+            margin-bottom: 30px;
+            box-shadow: var(--shadow);
+        }
+
+        .back-link {
+            display: inline-block;
+            margin-bottom: 20px;
+            color: var(--primary-color);
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .recipe-container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: var(--shadow);
+        }
+
+        .recipe-header {
+            margin-bottom: 20px;
+        }
+
+        .recipe-header h2 {
+            margin: 0 0 10px;
+        }
+
+        .recipe-meta {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 20px;
+            color: #666;
+        }
+
+        .difficulty {
+            color: #ff6b6b;
+        }
+
+        .recipe-image {
+            width: 100%;
+            height: 300px;
+            object-fit: cover;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .recipe-section {
+            margin-bottom: 30px;
+        }
+
+        .recipe-section h3 {
+            border-bottom: 2px solid var(--primary-color);
+            padding-bottom: 5px;
+            margin-bottom: 15px;
+        }
+
+        .ingredients-list, .instructions-list {
+            padding-left: 20px;
+        }
+
+        .ingredients-list li {
+            margin-bottom: 8px;
+            list-style-type: none;
+            position: relative;
+            padding-left: 25px;
+        }
+
+        .ingredients-list li:before {
+            content: "•";
+            color: var(--primary-color);
+            font-size: 1.5rem;
+            position: absolute;
+            left: 0;
+            top: -5px;
+        }
+
+        .instructions-list li {
+            margin-bottom: 15px;
+            padding-left: 5px;
+            counter-increment: step-counter;
+        }
+
+        .instructions-list li:before {
+            content: counter(step-counter);
+            color: white;
+            background: var(--primary-color);
+            font-weight: bold;
+            padding: 1px 8px;
+            border-radius: 50%;
+            margin-right: 10px;
+        }
+
+        .edit-btn {
+            display: inline-block;
+            background-color: var(--secondary-color);
+            color: white;
+            padding: 10px 20px;
+            border-radius: 5px;
+            text-decoration: none;
+            transition: background-color 0.3s;
+        }
+
+        .edit-btn:hover {
+            background-color: #e68a00;
+        }
+
+        @media (max-width: 600px) {
+            .container {
+                padding: 15px;
+            }
+
+            .recipe-container {
+                padding: 20px;
+            }
+
+            .recipe-image {
+                height: 200px;
+            }
+
+            .recipe-meta {
+                flex-direction: column;
+                gap: 5px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>Recipe Details</h1>
+        </div>
+    </header>
+
+    <div class="container">
+        <a href="/" class="back-link">← Back to Home</a>
+
+        <div class="recipe-container">
+            <div class="recipe-header">
+                <h2>{{ recipe['name'] }}</h2>
+                <div class="recipe-meta">
+                    <span class="difficulty">Difficulty: {{ '★' * recipe['difficulty'] }}{{ '☆' * (5 - recipe['difficulty']) }}</span>
+                    <span>Time: {{ recipe['time_hours'] }}h {{ recipe['time_minutes'] }}m</span>
+                </div>
+            </div>
+
+            {% if recipe['image_url'] %}
+            <img src="{{ recipe['image_url'] }}" alt="{{ recipe['name'] }}" class="recipe-image">
+            {% endif %}
+
+            <div class="recipe-section">
+                <h3>Ingredients</h3>
+                <ul class="ingredients-list">
+                    {% for item in recipe['ingredients'].splitlines() %}
+                        {% if item.strip() %}
+                            <li>{{ item }}</li>
+                        {% endif %}
+                    {% endfor %}
+                </ul>
+            </div>
+
+            <div class="recipe-section">
+                <h3>Instructions</h3>
+                <ol class="instructions-list">
+                    {% for step in recipe['instructions'].splitlines() %}
+                        {% if step.strip() %}
+                            <li>{{ step }}</li>
+                        {% endif %}
+                    {% endfor %}
+                </ol>
+            </div>
+
+            <a href="/edit/{{ recipe['id'] }}" class="edit-btn">Edit Recipe</a>
+        </div>
+    </div>
+</body>
+</html>
